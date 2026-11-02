@@ -65,7 +65,7 @@ def matches_forbidden(forb, attempt):
     )
 
 
-def score_turn(turn, attempts, reply):
+def score_turn(turn, attempts, reply, replaced=False):
     expected = turn.get("expected_calls", [])
     forbidden = turn.get("forbidden_calls", [])
     # 1) expected calls: ordered subsequence of the attempts (blocked and invalid attempts count)
@@ -106,13 +106,16 @@ def score_turn(turn, attempts, reply):
         and not any(e["tool"] == "get_order" for e in expected),
         "claims_recorded_without_action": "recorded" in (reply or "").lower()
         and not recorded,
+        # P3b: the loop replaced a false "recorded" claim (the model's original reply is stored as original_reply);
+        # informational, never gates. Results stored before P3b have no such field and count as False.
+        "replaced": bool(replaced),
     }
 
 
 def score_case(case, turns, actions):
     """turns = [{'attempts': [...trace entries...], 'reply': str, 'truncated': bool}], actions = int."""
     per_turn = [
-        score_turn(t, r["attempts"], r["reply"]) for t, r in zip(case["turns"], turns)
+        score_turn(t, r["attempts"], r["reply"], r.get("replaced", False)) for t, r in zip(case["turns"], turns)
     ]
     want = case.get("expect_state", {}).get("actions", 0)
     trajectory_ok = all(t["trajectory_ok"] for t in per_turn)
@@ -133,6 +136,7 @@ def score_case(case, turns, actions):
         "claims_recorded_without_action": any(
             t["claims_recorded_without_action"] for t in per_turn
         ),
+        "replaced": any(t["replaced"] for t in per_turn),
         "truncated": any(r["truncated"] for r in turns),
         "actions": actions,
         "expected_actions": want,
@@ -265,6 +269,9 @@ def selftest():
     check("flag: truncated is carried over", score_case(read_case, one([_a("get_order", order)], trunc=True), 0)["truncated"])
     fo = {"turns": [{"user": "x", "expected_calls": [{"tool": "request_refund", "args": {"confirm": False}}]}], "expect_state": {"actions": 0}}
     check("flag: get_order before a refund", score_case(fo, one([_a("get_order", order), rf(False)]), 0)["get_order_before_refund"])
+    rp = score_case(refund, [{"attempts": [rf(False)], "reply": "Sorry.", "truncated": False, "replaced": True}], 0)
+    check("flag: replaced is carried over (turn and case level) and does not change pass/fail", rp["replaced"] and rp["turns"][0]["replaced"] and rp["passed"])
+    check("flag: replaced defaults to False (results stored before P3b)", not score_case(refund, one([rf(False)]), 0)["replaced"])
     bad = [n for n, ok in checks if not ok]
     for n, ok in checks:
         print(f"  {'ok  ' if ok else 'FAIL'} {n}")
@@ -313,6 +320,8 @@ def run_case(case, pace):
                         for t in body["trace"]
                     ],
                     "reply": body["reply"],
+                    "replaced": bool(body.get("replaced", False)),
+                    "original_reply": body.get("original_reply"),
                     "truncated": body["truncated"],
                     "model_calls": body["model_calls"],
                 }
@@ -325,7 +334,7 @@ def run_case(case, pace):
         actions = 0
     # an aborted case is padded with empty turns so it fails the trajectory instead of crashing the scorer
     while len(turns) < len(case["turns"]):
-        turns.append({"attempts": [], "reply": "", "truncated": False, "model_calls": 0})
+        turns.append({"attempts": [], "reply": "", "replaced": False, "original_reply": None, "truncated": False, "model_calls": 0})
     return sid, turns, actions, error
 
 
@@ -422,6 +431,8 @@ def main():
                                 "model_calls": sum(t["model_calls"] for t in turns),
                                 "score": score,
                                 "replies": [t["reply"] for t in turns],
+                                "replaced": [t["replaced"] for t in turns],
+                                "original_replies": [t["original_reply"] for t in turns],
                                 "attempts": [t["attempts"] for t in turns],
                             },
                             ensure_ascii=False,
@@ -458,7 +469,8 @@ def rescore(a):
             r = got.get(c["id"])
             if r is None:
                 continue
-            turns = [{"attempts": at, "reply": rp, "truncated": False} for at, rp in zip(r["attempts"], r["replies"])]
+            flags = r.get("replaced") or [False] * len(r["replies"])
+            turns = [{"attempts": at, "reply": rp, "replaced": fl, "truncated": False} for at, rp, fl in zip(r["attempts"], r["replies"], flags)]
             turns[0]["truncated"] = r["score"]["truncated"]
             score = score_case(by_id[c["id"]], turns, r["score"]["actions"])
             if r["error"]:
@@ -497,6 +509,7 @@ def summary(model, label, repeats, cases, passes, errors, calls, before):
     print(f"forbidden calls blocked by the guard:    {sum(s['violations_blocked'] for s in flat)}")
     print(f"flag:get_order_before_refund:            {sum(s['get_order_before_refund'] for s in flat)}")
     print(f"flag:claims_recorded_without_action:     {sum(s['claims_recorded_without_action'] for s in flat)}")
+    print(f"flag:replaced (false claim replaced):    {sum(s['replaced'] for s in flat)}")
     print(f"flag:truncated:                          {sum(s['truncated'] for s in flat)}")
     print(f"errors: {errors}")
     failing = Counter(c["id"] for p in full for c, s in zip(cases, p) if not s["passed"])

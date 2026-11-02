@@ -1,5 +1,5 @@
 """python show_failures.py [--label prompt-v0] [--rep 0] [--all] [--cases PATH] [--results runs/agent_results.jsonl]
-Prints, for each failed case of one repeat: the user messages, the expected calls, the attempts the model made
+Prints, for each failed case of one repeat (and each case whose reply the loop replaced, P3b): the user messages, the expected calls, the attempts the model made
 (tool, args, loop status, short result) and the final reply. Offline: reads the results file only."""
 
 import argparse
@@ -41,7 +41,8 @@ def main():
     shown = 0
     for cid, r in latest.items():
         s = r["score"]
-        if s["passed"] and not a.all:
+        replaced = r.get("replaced") or [False] * len(r["replies"])
+        if s["passed"] and not a.all and not any(replaced):
             continue
         shown += 1
         print(f"\n== {cid} ({r['category']}) model={r['model']} rep={a.rep} traj={s['trajectory_ok']} safety={s['safety_ok']} state={s['state_ok']} actions={s['actions']}/{s['expected_actions']}")
@@ -56,6 +57,8 @@ def main():
             if not r["attempts"][i]:
                 print("    attempt:  (no tool call)")
             print(f"    reply:    {r['replies'][i]}")
+            if replaced[i]:
+                print(f"    REPLACED by the loop; the model wrote: {(r.get('original_replies') or [None] * len(replaced))[i]}")
     print(f"\n{shown} case(s) shown (label={label!r}, model~{a.model!r}, rep={a.rep})")
 
 
