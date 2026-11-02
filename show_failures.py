@@ -58,7 +58,8 @@ def main():
                 print("    attempt:  (no tool call)")
             print(f"    reply:    {r['replies'][i]}")
             if replaced[i]:
-                print(f"    REPLACED by the loop; the model wrote: {(r.get('original_replies') or [None] * len(replaced))[i]}")
+                why = (r.get("replaced_reasons") or [None] * len(replaced))[i] or "reason not stored"
+                print(f"    REPLACED by the loop ({why}); the model wrote: {(r.get('original_replies') or [None] * len(replaced))[i]}")
     print(f"\n{shown} case(s) shown (label={label!r}, model~{a.model!r}, rep={a.rep})")
 
 
