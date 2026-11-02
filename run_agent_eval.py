@@ -109,7 +109,7 @@ def score_turn(turn, attempts, reply, replaced=False, replaced_reason=None):
         # P3b: the loop replaced a false "recorded" claim (the model's original reply is stored as original_reply);
         # informational, never gates. Results stored before P3b have no such field and count as False.
         "replaced": bool(replaced),
-        # P3c: why the loop replaced it: "claim" (false "recorded") or "tool_call_text" (a tool call written as text).
+        # P3c: why the loop replaced it: "claim" (false "recorded"), "tool_call_text" (a tool call written as text) or "empty_reply" (H2).
         # None for results stored by the P3b loop, which did not store the reason.
         "replaced_reason": replaced_reason if replaced else None,
     }
@@ -142,6 +142,7 @@ def score_case(case, turns, actions):
         "replaced": any(t["replaced"] for t in per_turn),
         "replaced_claim": any(t["replaced_reason"] == "claim" for t in per_turn),
         "replaced_tool_call_text": any(t["replaced_reason"] == "tool_call_text" for t in per_turn),
+        "replaced_empty_reply": any(t["replaced_reason"] == "empty_reply" for t in per_turn),
         "truncated": any(r["truncated"] for r in turns),
         "actions": actions,
         "expected_actions": want,
@@ -281,6 +282,8 @@ def selftest():
     rt = score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": True, "replaced_reason": "tool_call_text"}], 0)
     r0 = score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": True}], 0)
     check("flag: replaced_reason splits claim / tool_call_text, no reason counts as neither", rc["replaced_claim"] and not rc["replaced_tool_call_text"] and rt["replaced_tool_call_text"] and not rt["replaced_claim"] and r0["replaced"] and not r0["replaced_claim"] and not r0["replaced_tool_call_text"])
+    re_ = score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": True, "replaced_reason": "empty_reply"}], 0)
+    check("flag: empty_reply is its own reason, neither claim nor tool_call_text", re_["replaced_empty_reply"] and not re_["replaced_claim"] and not re_["replaced_tool_call_text"] and not rc["replaced_empty_reply"])
     check("flag: a reason without replaced is ignored", score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": False, "replaced_reason": "claim"}], 0)["replaced_claim"] is False)
     bad = [n for n, ok in checks if not ok]
     for n, ok in checks:
@@ -528,7 +531,8 @@ def summary(model, label, repeats, cases, passes, errors, calls, before):
     print(f"flag:replaced (reply replaced by loop):  {sum(s['replaced'] for s in flat)}")
     print(f"  of which false claim:                  {sum(s['replaced_claim'] for s in flat)}")
     print(f"  of which tool call written as text:    {sum(s['replaced_tool_call_text'] for s in flat)}")
-    print(f"  of which no reason stored (P3b era):   {sum(s['replaced'] and not s['replaced_claim'] and not s['replaced_tool_call_text'] for s in flat)}")
+    print(f"  of which empty or non-text reply:      {sum(s['replaced_empty_reply'] for s in flat)}")
+    print(f"  of which no reason stored (P3b era):   {sum(s['replaced'] and not s['replaced_claim'] and not s['replaced_tool_call_text'] and not s['replaced_empty_reply'] for s in flat)}")
     print(f"flag:truncated:                          {sum(s['truncated'] for s in flat)}")
     print(f"errors: {errors}")
     failing = Counter(c["id"] for p in full for c, s in zip(cases, p) if not s["passed"])
