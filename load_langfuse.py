@@ -1,8 +1,14 @@
 """Load runs/agent_results.jsonl into Langfuse v4 (OTLP traces + /api/public/scores).
 Dry run by default.
-Usage: python load_langfuse.py | --send --limit 1 | --send | --send --scores-only --limit 1
+Usage: python load_langfuse.py                    dry run (what a send would do)
+       python load_langfuse.py --send             load everything not yet in the ledger
+       python load_langfuse.py --send --label jenkins-75-   only rows whose label starts so
+       python load_langfuse.py --mark-loaded      record units in the ledger, send nothing
+       python load_langfuse.py --send --scores-only --limit 1   retry scores (upsert)
+Ledger runs/langfuse_loaded.txt: one trace id per line, written after a unit's spans were
+accepted. A normal --send skips ledger units, so spans can never be duplicated.
 Scores go in batches of 50 via /api/public/ingestion (score-create), with a one-by-one
-fallback on /api/public/scores. --scores-only re-sends scores only (upsert, no duplicates).
+fallback on /api/public/scores. --scores-only ignores the ledger (scores upsert by id).
 Held-out rows: category-level aggregates only (no id, replies, attempts)."""
 
 import argparse, collections, json, os, sys, time, uuid
@@ -12,6 +18,7 @@ import requests
 
 ROOT = Path(__file__).parent
 RUNS = ROOT / "runs" / "agent_results.jsonl"
+LEDGER = ROOT / "runs" / "langfuse_loaded.txt"
 NS = uuid.UUID("6f1c0f2e-5b1a-4c55-9a0e-3d8f2b7a1c01")
 
 
@@ -220,6 +227,21 @@ def heldout_units(rows):
     return units
 
 
+def unit_id(u):
+    return u[0][0]["traceId"]  # root span comes first
+
+
+def read_ledger():
+    return set(LEDGER.read_text(encoding="utf-8").split()) if LEDGER.exists() else set()
+
+
+def mark(ids):
+    LEDGER.parent.mkdir(exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8", newline="\n") as f:
+        for i in ids:
+            f.write(i + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--send", action="store_true")
@@ -227,6 +249,17 @@ def main():
         "--scores-only",
         action="store_true",
         help="send scores only, no traces (scores upsert by id; spans do not)",
+    )
+    ap.add_argument(
+        "--mark-loaded",
+        action="store_true",
+        help="write the selected units to the ledger without sending (seeding)",
+    )
+    ap.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="only rows whose label starts with this (repeatable)",
     )
     ap.add_argument(
         "--limit", type=int, default=0, help="max dev traces (0 = all dev + held-out)"
@@ -238,23 +271,55 @@ def main():
         for l in RUNS.read_text(encoding="utf-8").splitlines()
         if l.strip()
     ]
+    if a.label:
+        rows = [r for r in rows if any(r["label"].startswith(p) for p in a.label)]
     dev = [r for r in rows if "heldout" not in r["label"]]
     ho = [r for r in rows if "heldout" in r["label"]]
     units = [dev_unit(r) for r in dev]
     units = units[: a.limit] if a.limit else units + heldout_units(ho)
+    selected = len(units)
+    if a.mark_loaded:
+        done = read_ledger()
+        new = [unit_id(u) for u in units if unit_id(u) not in done]
+        mark(new)
+        print(f"ledger: marked {len(new)} new, {selected - len(new)} already there")
+        return
+    skipped = 0
+    if not a.scores_only:
+        done = read_ledger()
+        skipped = sum(1 for u in units if unit_id(u) in done)
+        units = [u for u in units if unit_id(u) not in done]
     n_scores = sum(len(u[1]) for u in units)
     n_spans = sum(len(u[0]) for u in units)
     print(
-        f"rows {len(rows)} (dev {len(dev)}, heldout {len(ho)}); traces {len(units)}; spans {n_spans}; scores {n_scores}"
+        f"rows {len(rows)} (dev {len(dev)}, heldout {len(ho)}); selected {selected}; "
+        f"skipped (in ledger) {skipped}; traces {len(units)}; spans {n_spans}; scores {n_scores}"
     )
     if not a.send:
         print("dry run: nothing sent")
         return
+    if not units:
+        print("nothing to send")
+        return
     host = os.environ["LANGFUSE_HOST"].rstrip("/")
     auth = (os.environ["LANGFUSE_PUBLIC_KEY"], os.environ["LANGFUSE_SECRET_KEY"])
-    if not a.scores_only:
-        spans = [s for u in units for s in u[0]]
-        for i in range(0, len(spans), 50):
+    if a.scores_only:
+        batches = [units]
+    else:  # unit-aligned batches of about 50 spans
+        batches, cur, n = [], [], 0
+        for u in units:
+            cur.append(u)
+            n += len(u[0])
+            if n >= 50:
+                batches.append(cur)
+                cur, n = [], 0
+        if cur:
+            batches.append(cur)
+    t0 = time.time()
+    ok = bad = fallback = sent_units = 0
+    for b in batches:
+        if not a.scores_only:
+            spans = [s for u in b for s in u[0]]
             body = {
                 "resourceSpans": [
                     {
@@ -262,10 +327,7 @@ def main():
                             "attributes": [sv("service.name", "agent-gate-loader")]
                         },
                         "scopeSpans": [
-                            {
-                                "scope": {"name": "load_langfuse"},
-                                "spans": spans[i : i + 50],
-                            }
+                            {"scope": {"name": "load_langfuse"}, "spans": spans}
                         ],
                     }
                 ]
@@ -279,13 +341,24 @@ def main():
             )
             if r.status_code != 200:
                 print("traces HTTP", r.status_code, r.text[:200])
+                print(
+                    f"stopped: {sent_units} units loaded; units of this batch are NOT in the ledger"
+                )
+                print(
+                    "fix the cause, then run the same command again (ledger skips loaded units)"
+                )
                 sys.exit(1)
-        print(f"traces sent: {len(units)} ({len(spans)} spans)")
-    t0 = time.time()
-    ok, bad, fallback = send_scores(host, auth, [s for u in units for s in u[1]])
+            mark([unit_id(u) for u in b])  # spans do not upsert: record right away
+            sent_units += len(b)
+        o, bd, fb = send_scores(host, auth, [s for u in b for s in u[1]])
+        ok, bad, fallback = ok + o, bad + bd, fallback + fb
+    if not a.scores_only:
+        print(f"traces sent: {sent_units} ({n_spans} spans), ledger updated")
     print(
         f"scores sent: {ok} ok, {bad} errors, {fallback} via fallback, {time.time() - t0:.1f} s"
     )
+    if bad:
+        print("retry the scores with --scores-only (same --label / --limit)")
 
 
 def send_one(host, auth, s):
