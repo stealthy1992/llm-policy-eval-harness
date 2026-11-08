@@ -2,16 +2,20 @@
 
   python run_agent_eval.py --selftest                     offline: unit checks of the scorer, no server
   python run_agent_eval.py --check [--cases PATH]         offline: validate the cases file
-  python run_agent_eval.py [--cases PATH] [--repeats 3] [--ids a,b] [--label prompt-v0] [--rpm N]
+  python run_agent_eval.py [--cases PATH] [--repeats 3] [--ids a,b] [--label prompt-v0] [--rpm N] [--no-langfuse]
 
 The agent is started separately (AGENT_PROVIDER=ollama|gemini, AGENT_BACKEND=mock) and the scorer talks to it
 over HTTP (AGENT_URL, default http://localhost:3201). Results are appended to runs/agent_results.jsonl.
+After the summary (and before the --gate exit) the run's rows are loaded into Langfuse by load_langfuse.py
+(best effort: needs --label, never changes the exit code; skip it with --no-langfuse).
 """
 
 import argparse
 import json
 import os
 import statistics
+import subprocess
+import sys
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -26,6 +30,7 @@ DEFAULT_CASES = os.environ.get(
 )
 RUNS_DIR = Path("runs")
 REQUEST_TIMEOUT_S = 300
+LANGFUSE_TIMEOUT_S = 300
 TRAJECTORY_MIN = 12  # ship rule: median repeat must reach this many of the 15 cases
 CATEGORIES = ("read", "multi_step", "abstain", "bad_input", "write_gate", "injection")
 
@@ -285,15 +290,57 @@ def selftest():
     re_ = score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": True, "replaced_reason": "empty_reply"}], 0)
     check("flag: empty_reply is its own reason, neither claim nor tool_call_text", re_["replaced_empty_reply"] and not re_["replaced_claim"] and not re_["replaced_tool_call_text"] and not rc["replaced_empty_reply"])
     check("flag: a reason without replaced is ignored", score_case(refund, [{"attempts": [rf(False)], "reply": "x", "truncated": False, "replaced": False, "replaced_reason": "claim"}], 0)["replaced_claim"] is False)
-    bad = [n for n, ok in checks if not ok]
-    for n, ok in checks:
-        print(f"  {'ok  ' if ok else 'FAIL'} {n}")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ok_loader = Path(tmp) / "ok_loader.py"
+        ok_loader.write_text("print('fake loader ok')\n", encoding="utf-8")
+        slow_loader = Path(tmp) / "slow_loader.py"
+        slow_loader.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+        bad_loader = Path(tmp) / "bad_loader.py"
+        bad_loader.write_text("raise SystemExit(3)\n", encoding="utf-8")
+        check("langfuse: no label is skipped, the loader is not run", load_into_langfuse("", loader=ok_loader) is False)
+        check("langfuse: a loader that exits 0 returns True", load_into_langfuse("x", loader=ok_loader) is True)
+        check("langfuse: a missing loader file does not raise", load_into_langfuse("x", loader=Path(tmp) / "nope.py") is False)
+        check("langfuse: a loader that exits non-zero does not raise", load_into_langfuse("x", loader=bad_loader) is False)
+        check("langfuse: a loader that hangs is cut off by the timeout, no raise", load_into_langfuse("x", loader=slow_loader, timeout=1) is False)
     check("gate: ship rule met and no errors passes", gate_ok(True, 0))
     check("gate: an errored case fails the gate", not gate_ok(True, 1))
     check("gate: ship rule not met fails the gate", not gate_ok(False, 0))
+    bad = [n for n, ok in checks if not ok]
+    for n, ok in checks:
+        print(f"  {'ok  ' if ok else 'FAIL'} {n}")
     print(f"\n{len(checks) - len(bad)} passed, {len(bad)} failed")
     print("selftest: OK" if not bad else "selftest: FAILED")
     return not bad
+
+
+# ---------------------------------------------------------------- Langfuse (best effort)
+def load_into_langfuse(label, loader=None, timeout=LANGFUSE_TIMEOUT_S):
+    """Load this run's rows into Langfuse. Never raises and never changes the exit code.
+    Returns True only when the loader exited 0. The loader skips rows already in its ledger."""
+    if not label:
+        print("langfuse: skipped (no --label)")
+        return False
+    loader = Path(loader) if loader else Path(__file__).resolve().parent / "load_langfuse.py"
+    try:
+        p = subprocess.run(
+            [sys.executable, str(loader), "--send", "--label", label],
+            cwd=str(loader.parent),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort by design
+        print(f"langfuse: skipped ({type(exc).__name__}: {str(exc)[:100]})")
+        return False
+    out = (p.stdout or "").strip().splitlines()
+    err = (p.stderr or "").strip().splitlines()
+    if p.returncode == 0:
+        print("langfuse: " + " | ".join(out[-3:]))
+        return True
+    print(f"langfuse: NOT loaded (loader exit {p.returncode}): " + " | ".join((out[-1:] + err[-1:])))
+    return False
 
 
 # ---------------------------------------------------------------- talking to the agent
@@ -390,6 +437,7 @@ def main():
     ap.add_argument("--rpm", type=float, default=-1, help="max model requests per minute; default 12 for gemini, none otherwise")
     ap.add_argument("--max-errors", type=int, default=3, help="stop after N consecutive errored cases")
     ap.add_argument("--min-trajectory", type=int, default=TRAJECTORY_MIN, help="ship rule: median trajectory matches needed (default 12, for the 15 dev cases)")
+    ap.add_argument("--no-langfuse", action="store_true", help="do not load this run's rows into Langfuse")
     ap.add_argument("--gate", action="store_true", help="exit code 1 unless the ship rule holds and no case errored (for Jenkins)")
     a = ap.parse_args()
     if a.selftest:
@@ -468,6 +516,8 @@ def main():
         print(f"\nSTOPPED EARLY: {e or 'Ctrl+C'} (the unfinished pass is left out of the summary)")
     calls = sum(t["model_calls"] for _, _, ts in results for t in ts)
     eligible = summary(model, a.label, a.repeats, cases, passes, errors, calls, before, a.min_trajectory)
+    if not a.no_langfuse:
+        load_into_langfuse(a.label)
     if a.gate:
         passed_gate = gate_ok(eligible, errors)
         print(f"gate: {'PASS' if passed_gate else 'FAIL'} (ship rule {'met' if eligible else 'not met'}, errors {errors})")
