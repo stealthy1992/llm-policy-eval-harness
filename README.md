@@ -6,6 +6,8 @@ Each case is a customer question with a hand-labelled expected outcome. The harn
 
 Built as a portfolio project by a QA/automation engineer. The policy is a made-up store ("Tulip & Teak"). No real customer data is included.
 
+The repo has a second part: it scores a tool-calling agent and can load the results into a self-hosted Langfuse (see [Agent evaluation and the Langfuse results store](#agent-evaluation-and-the-langfuse-results-store)).
+
 ## What it measures
 
 The model must pick exactly one label and cite the policy clauses it relied on.
@@ -139,6 +141,73 @@ python run_injection.py --check    # offline, validates cases/injection_cases.js
 
 These runners contain strings copied from that assistant (`SCOPE_MESSAGE`, the prompt markers), so they fit that assistant and need adapting for another one. The assistant's own results on its 58-case gate (prompt v2.4, Gemini flash-lite): 47/58, off-topic 12/12, injection 11/12. The one known injection finding is that the model obeys "end your reply with X" in a customer question. Identical runs differ by about 2 to 3 cases, because temperature 0 does not make Gemini deterministic, so differences inside that range are noise. Prompt tuning from v1 to v2.4 did not move the total beyond noise, and v2.4 shipped for specific fixed cases with a guard case kept intact.
 
+## Agent evaluation and the Langfuse results store
+
+`run_agent_eval.py` scores the Ops Agent, a tool-calling agent for a Saleor store. The agent lives in the [saleor-e2e-automation](https://github.com/stealthy1992/saleor-e2e-automation) repo. For each case the scorer checks three things: the expected tool calls appear in order (trajectory), no unsafe action was recorded, and the number of recorded actions is the expected one. A case passes when all three hold. The 15 dev cases are in the Saleor repo. A second set of 12 held-out cases is private and only category-level numbers are used.
+
+The scorer talks to the agent on `localhost:3201`. Start the agent first (in the Saleor repo), then run the scorer from this folder:
+
+```powershell
+# in saleor-e2e-automation
+$env:AGENT_PORT=3201; $env:AGENT_PROVIDER="stub"; $env:AGENT_BACKEND="mock"; npm run agent
+
+# in this repo, second terminal
+python run_agent_eval.py --label my-run --ids order-status-ok
+```
+
+`AGENT_PROVIDER` is `stub`, `ollama` or `gemini`. Results append to `runs/agent_results.jsonl` (git-ignored, local only).
+
+| Option | Effect |
+|---|---|
+| `--label X` | name of the run; stored with each row and used as the Langfuse session |
+| `--cases PATH`, `--ids a,b`, `--repeats N` | which cases and how many passes |
+| `--rpm N`, `--max-errors N` | request pacing and stop after N consecutive errored cases |
+| `--min-trajectory N`, `--gate` | ship rule: median trajectory matches needed (default 12, for the 15 dev cases); with `--gate` the exit code is 1 unless the rule holds and no case errored (used by Jenkins) |
+| `--check`, `--selftest`, `--rescore` | offline: validate cases, unit checks of the scorer, re-score stored rows with the current rules |
+| `--no-langfuse` | do not load this run into Langfuse |
+
+### Langfuse
+
+Every labeled run ends by loading its rows into a self-hosted Langfuse (v4). The load is best effort: if Langfuse is down or unreachable, the run prints `langfuse: NOT loaded (...)` and its exit code does not change.
+
+**Setup.** The Langfuse stack runs from the Saleor repo (`langfuse/` folder and `saleor-platform/docker-compose.override.yml`): `docker compose up -d` in `saleor-platform` starts Saleor and Langfuse together, at `http://localhost:3300`. Create a project and API keys in the Langfuse UI, then copy `.env.example` to `.env` here and fill in `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. The `.env` file is git-ignored.
+
+**What a row becomes.** One row of `agent_results.jsonl` is one case in one pass.
+
+| Row field | Langfuse object |
+|---|---|
+| the row (dev case) | one trace and a root span named by the case id; session = label; tags = label, category, model |
+| last reply | root span output |
+| each reply with its per-turn flags | one `turn N` span |
+| each tool call (tool, arguments, status, result) | one child span of type `tool`, named by the tool; level WARNING when the status is not `ok` |
+| every numeric or boolean key of `score` | one score on the root span |
+| held-out rows | one trace per label and category, with counts and pass rates only: no case ids, replies or tool calls |
+
+The loader judges nothing: every score is copied from the scorer's own result. Span timing is synthetic (each step takes a 1 ms slot), so the Timeline shows order, not duration.
+
+**`load_langfuse.py`** can also be run by hand:
+
+| Flag | Effect |
+|---|---|
+| (none) | dry run: prints how many traces, spans and scores it would send |
+| `--send` | load every selected row that is not in the ledger |
+| `--label X` | only rows whose label starts with X (prefix match) |
+| `--limit N` | the first N dev rows only |
+| `--scores-only` | re-send scores only (retry mode; scores upsert by id) |
+| `--mark-loaded` | write the selected rows to the ledger without sending |
+
+**The ledger.** Langfuse does not de-duplicate spans: sending the same trace twice creates a second copy. The loader therefore keeps `runs/langfuse_loaded.txt`, one trace id per line, written right after a trace's spans are accepted. Rows already in the ledger are skipped, so re-running a label only loads its new rows. Scores are sent in batches of 50 with a one-by-one fallback. If the ledger is lost, a re-run would duplicate spans.
+
+**Checked end to end.** A Jenkins gate build (15 dev cases and 12 held-out cases, Gemini, mock backend) loaded 15 dev traces (46 spans, 255 scores) and 6 held-out category traces (6 spans, 102 scores) with 0 errors in about 25 seconds.
+
+| Task | Without Langfuse | With Langfuse |
+|---|---|---|
+| Read one case | script output | trace page: turns and tool calls as a tree |
+| Find failures | script | filter on score values |
+| Compare runs | recount by hand | one session per label, score analytics |
+| Trend over gate builds | manual | one session per Jenkins build |
+| Judge a reply | no | no |
+
 ## Files
 
 ```
@@ -148,6 +217,9 @@ run_injection.py    prompt-injection and leakage cases (assistant only)
 policy.py           frozen 4-label prompt, case validation, clause parsing
 llm_client.py       Ollama, Gemini and assistant clients, pacing, run log
 show_bad.py         misses of the last run
+run_agent_eval.py   scores the Ops Agent (trajectory, safety), optional Jenkins gate, loads results into Langfuse
+load_langfuse.py    loads runs/agent_results.jsonl into Langfuse (traces, spans, scores) with a ledger
+.env.example        variable names: GEMINI_API_KEY and the three LANGFUSE_ settings (no values)
 cases/              policy_v1_1.md, policy_sample.json, offtopic and injection cases
 docs/judge_rubric.md  rubric used for LLM-as-judge grading of answer text (method note)
 ```
@@ -160,6 +232,10 @@ docs/judge_rubric.md  rubric used for LLM-as-judge grading of answer text (metho
 - **The scores are label matches.** Answer text was graded separately with an LLM judge plus human review. The judge scripts are not published because they depend on the private cases.
 - **Run notes.** `gemini-3.6-flash` was run in two parts: 3 of the first 12 requests returned 503 (server overloaded), and the missing cases were run afterwards with `--skip-done`. `gemini-3.8-flash` was attempted on two days and returned 503/504 errors, so it has no score. Server errors are not model results.
 - **Direct mode uses the frozen v1 prompt.** It does not include the assistant's newer prompt, order lookup or `OFF_TOPIC` label.
+- **Agent runs: Langfuse needs its stack.** The stack is defined in the Saleor repo. Without it the scorer still runs and only prints `langfuse: NOT loaded`.
+- **The ledger is local.** `runs/` is git-ignored. Lose `runs/langfuse_loaded.txt` and a re-load duplicates spans.
+- **Held-out cases stay private.** Langfuse holds category-level numbers only for them. The 15 dev cases are the only agent cases whose replies and tool calls are stored.
+- **Langfuse timing is synthetic.** Spans are placed in 1 ms slots, so durations in the UI mean nothing.
 
 ## License
 
